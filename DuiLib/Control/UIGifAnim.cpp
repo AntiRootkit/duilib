@@ -53,7 +53,7 @@ namespace DuiLib
 		m_bIsAutoPlay		=	true;
 		m_bIsAutoSize		=	false;
 		m_bIsPlaying		=	false;
-
+		m_pStream				=	NULL;
 	}
 
 
@@ -66,7 +66,7 @@ namespace DuiLib
 
 	LPCTSTR CGifAnimUI::GetClass() const
 	{
-		return _T("GifAnimUI");
+		return DUI_CTR_GIFANIM;
 	}
 
 	LPVOID CGifAnimUI::GetInterface( LPCTSTR pstrName )
@@ -80,14 +80,14 @@ namespace DuiLib
 		InitGifImage();
 	}
 
-	void CGifAnimUI::DoPaint( HDC hDC, const RECT& rcPaint )
+	bool CGifAnimUI::DoPaint(HDC hDC, const RECT& rcPaint, CControlUI* pStopControl)
 	{
-		if( !::IntersectRect( &m_rcPaint, &rcPaint, &m_rcItem ) ) return;
 		if ( NULL == m_pGifImage )
 		{		
 			InitGifImage();
 		}
 		DrawFrame( hDC );
+        return true;
 	}
 
 	void CGifAnimUI::DoEvent( TEventUI& event )
@@ -207,7 +207,7 @@ namespace DuiLib
 		int nSize		=	m_pGifImage->GetPropertyItemSize( PropertyTagFrameDelay );
 		m_pPropertyItem	=	(Gdiplus::PropertyItem*) malloc( nSize );
 		m_pGifImage->GetPropertyItem( PropertyTagFrameDelay, nSize, m_pPropertyItem );
-		delete  pDimensionIDs;
+		delete[] pDimensionIDs;
 		pDimensionIDs = NULL;
 
 		if (m_bIsAutoSize)
@@ -215,7 +215,7 @@ namespace DuiLib
 			SetFixedWidth(m_pGifImage->GetWidth());
 			SetFixedHeight(m_pGifImage->GetHeight());
 		}
-		if (m_bIsAutoPlay)
+		if (m_bIsAutoPlay && nSize > 0)
 		{
 			PlayGif();
 		}
@@ -223,6 +223,11 @@ namespace DuiLib
 
 	void CGifAnimUI::DeleteGif()
 	{
+		if (m_pStream != NULL )
+		{
+			m_pStream->Release();
+			m_pStream = NULL;
+		}
 		if ( m_pGifImage != NULL )
 		{
 			delete m_pGifImage;
@@ -314,7 +319,7 @@ namespace DuiLib
 
 		while (!pData)
 		{
-			//¶Á²»µ½Í¼Æ¬, ÔòÖ±½ÓÈ¥¶ÁÈ¡bitmap.m_lpstrÖ¸ÏòµÄÂ·¾¶
+			//è¯»ä¸åˆ°å›¾ç‰‡, åˆ™ç›´æŽ¥åŽ»è¯»å–bitmap.m_lpstræŒ‡å‘çš„è·¯å¾„
 			HANDLE hFile = ::CreateFile(pstrGifPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, \
 				FILE_ATTRIBUTE_NORMAL, NULL);
 			if( hFile == INVALID_HANDLE_VALUE ) break;
@@ -338,28 +343,27 @@ namespace DuiLib
 		}
 
 		Gdiplus::Image* pImage = LoadGifFromMemory(pData, dwSize);
-		delete pData;
+		delete[] pData;
 		return pImage;
 	}
 
 	Gdiplus::Image* CGifAnimUI::LoadGifFromMemory( LPVOID pBuf,size_t dwSize )
 	{
-		HGLOBAL hMem = ::GlobalAlloc(GMEM_FIXED, dwSize);
+		HGLOBAL hMem = ::GlobalAlloc(GMEM_MOVEABLE, dwSize);
 		BYTE* pMem = (BYTE*)::GlobalLock(hMem);
 
 		memcpy(pMem, pBuf, dwSize);
+		::GlobalUnlock(hMem);
 
-		IStream* pStm = NULL;
-		::CreateStreamOnHGlobal(hMem, TRUE, &pStm);
-		Gdiplus::Image *pImg = Gdiplus::Image::FromStream(pStm);
+		::CreateStreamOnHGlobal(hMem, TRUE, &m_pStream);
+		Gdiplus::Image *pImg = Gdiplus::Image::FromStream(m_pStream);
 		if(!pImg || pImg->GetLastStatus() != Gdiplus::Ok)
 		{
-			pStm->Release();
-			::GlobalUnlock(hMem);
+			m_pStream->Release();
+			m_pStream = NULL;
 			return 0;
 		}
 		return pImg;
 	}
-
 
 }

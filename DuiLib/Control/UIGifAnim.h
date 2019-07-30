@@ -9,7 +9,7 @@ namespace DuiLib
 
 #define EVENT_TIEM_ID	100
 
-	class UILIB_API CGifAnimUI : public CControlUI
+	class DUILIB_API CGifAnimUI : public CControlUI
 	{
 	public:
 		CGifAnimUI(void);
@@ -18,10 +18,10 @@ namespace DuiLib
 		LPCTSTR	GetClass() const;
 		LPVOID	GetInterface(LPCTSTR pstrName);
 		void	DoInit() override;
-		void	DoPaint(HDC hDC, const RECT& rcPaint) override;
-		void	DoEvent(TEventUI& event) override;
-		void	SetVisible(bool bVisible = true ) override;
-		void	SetAttribute(LPCTSTR pstrName, LPCTSTR pstrValue) override;
+		bool	DoPaint(HDC hDC, const RECT& rcPaint, CControlUI* pStopControl);
+		void	DoEvent(TEventUI& event);
+		void	SetVisible(bool bVisible = true );
+		void	SetAttribute(LPCTSTR pstrName, LPCTSTR pstrValue);
 		void	SetBkImage(LPCTSTR pStrImage);
 		LPCTSTR GetBkImage();
 
@@ -50,7 +50,7 @@ namespace DuiLib
 		bool			m_bIsAutoPlay;				// 是否自动播放gif
 		bool			m_bIsAutoSize;				// 是否自动根据图片设置大小
 		bool			m_bIsPlaying;
-
+		IStream*	m_pStream;
 	};
 }
 

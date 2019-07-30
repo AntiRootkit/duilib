@@ -71,31 +71,6 @@ void tagTDrawInfo::Clear()
 }
 
 /////////////////////////////////////////////////////////////////////////////////////
-
-static HBITMAP CreateARGB32Bitmap(HDC hDC, int cx, int cy, COLORREF** pBits)
-{
-	LPBITMAPINFO lpbiSrc = NULL;
-	lpbiSrc = (LPBITMAPINFO) new BYTE[sizeof(BITMAPINFOHEADER)];
-	if (lpbiSrc == NULL) return NULL;
-
-	lpbiSrc->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-	lpbiSrc->bmiHeader.biWidth = cx;
-	lpbiSrc->bmiHeader.biHeight = cy;
-	lpbiSrc->bmiHeader.biPlanes = 1;
-	lpbiSrc->bmiHeader.biBitCount = 32;
-	lpbiSrc->bmiHeader.biCompression = BI_RGB;
-	lpbiSrc->bmiHeader.biSizeImage = cx * cy;
-	lpbiSrc->bmiHeader.biXPelsPerMeter = 0;
-	lpbiSrc->bmiHeader.biYPelsPerMeter = 0;
-	lpbiSrc->bmiHeader.biClrUsed = 0;
-	lpbiSrc->bmiHeader.biClrImportant = 0;
-
-	HBITMAP hBitmap = CreateDIBSection (hDC, lpbiSrc, DIB_RGB_COLORS, (void **)pBits, NULL, NULL);
-	delete [] lpbiSrc;
-	return hBitmap;
-}
-
-/////////////////////////////////////////////////////////////////////////////////////
 typedef BOOL (__stdcall *PFUNCUPDATELAYEREDWINDOW)(HWND, HDC, POINT*, SIZE*, HDC, POINT*, COLORREF, BLENDFUNCTION*, DWORD);
 PFUNCUPDATELAYEREDWINDOW g_fUpdateLayeredWindow = NULL;
 
@@ -112,8 +87,8 @@ bool CPaintManagerUI::m_bUseHSL = false;
 short CPaintManagerUI::m_H = 180;
 short CPaintManagerUI::m_S = 100;
 short CPaintManagerUI::m_L = 100;
-CStdPtrArray CPaintManagerUI::m_aPreMessages;
-CStdPtrArray CPaintManagerUI::m_aPlugins;
+CDuiPtrArray CPaintManagerUI::m_aPreMessages;
+CDuiPtrArray CPaintManagerUI::m_aPlugins;
 
 CPaintManagerUI::CPaintManagerUI() :
 m_hWndPaint(NULL),
@@ -125,8 +100,10 @@ m_pOffscreenBits(NULL),
 m_hbmpBackground(NULL),
 m_pBackgroundBits(NULL),
 m_iTooltipWidth(-1),
+m_iLastTooltipWidth(-1),
 m_hwndTooltip(NULL),
 m_iHoverTime(1000),
+m_bNoActivate(false),
 m_bShowUpdateRect(false),
 m_uTimerID(0x1000),
 m_pRoot(NULL),
@@ -134,13 +111,17 @@ m_pFocus(NULL),
 m_pEventHover(NULL),
 m_pEventClick(NULL),
 m_pEventKey(NULL),
+m_pLastToolTip(NULL),
 m_bFirstLayout(true),
 m_bFocusNeeded(false),
 m_bUpdateNeeded(false),
 m_bMouseTracking(false),
 m_bMouseCapture(false),
+m_bIsPainting(false),
 m_bOffscreenPaint(true),
 m_bUsedVirtualWnd(false),
+m_bAsyncNotifyPosted(false),
+m_bForceUseSharedRes(false),
 m_nOpacity(0xFF),
 m_bLayered(false),
 m_bLayeredChanged(false)
@@ -196,10 +177,10 @@ m_bLayeredChanged(false)
 CPaintManagerUI::~CPaintManagerUI()
 {
     // Delete the control-tree structures
-    for( int i = 0; i < m_aDelayedCleanup.GetSize(); i++ ) delete static_cast<CControlUI*>(m_aDelayedCleanup[i]);
+    for( int i = 0; i < m_aDelayedCleanup.GetSize(); i++ ) static_cast<CControlUI*>(m_aDelayedCleanup[i])->Delete();
     for( int i = 0; i < m_aAsyncNotify.GetSize(); i++ ) delete static_cast<TNotifyUI*>(m_aAsyncNotify[i]);
     m_mNameHash.Resize(0);
-    if( m_pRoot != NULL ) delete m_pRoot;
+    if( m_pRoot != NULL ) m_pRoot->Delete();
 
     ::DeleteObject(m_ResInfo.m_DefaultFontInfo.hFont);
     RemoveAllFonts();
@@ -215,6 +196,7 @@ CPaintManagerUI::~CPaintManagerUI()
 		::DestroyWindow(m_hwndTooltip);
 		m_hwndTooltip = NULL;
 	}
+    m_pLastToolTip = NULL;
     if( m_hDcOffscreen != NULL ) ::DeleteDC(m_hDcOffscreen);
     if( m_hDcBackground != NULL ) ::DeleteDC(m_hDcBackground);
     if( m_hbmpOffscreen != NULL ) ::DeleteObject(m_hbmpOffscreen);
@@ -391,7 +373,7 @@ CPaintManagerUI* CPaintManagerUI::GetPaintManager(LPCTSTR pstrName)
 	return NULL;
 }
 
-CStdPtrArray* CPaintManagerUI::GetPaintManagers()
+CDuiPtrArray* CPaintManagerUI::GetPaintManagers()
 {
 	return &m_aPreMessages;
 }
@@ -412,7 +394,7 @@ bool CPaintManagerUI::LoadPlugin(LPCTSTR pstrModuleName)
     return false;
 }
 
-CStdPtrArray* CPaintManagerUI::GetPlugins()
+CDuiPtrArray* CPaintManagerUI::GetPlugins()
 {
     return &m_aPlugins;
 }
@@ -460,6 +442,11 @@ LPCTSTR CPaintManagerUI::GetName() const
 HDC CPaintManagerUI::GetPaintDC() const
 {
     return m_hDcPaint;
+}
+
+HBITMAP CPaintManagerUI::GetPaintOffscreenBitmap()
+{
+	return m_hbmpOffscreen;
 }
 
 POINT CPaintManagerUI::GetMousePos() const
@@ -553,6 +540,16 @@ void CPaintManagerUI::SetShowUpdateRect(bool show)
     m_bShowUpdateRect = show;
 }
 
+bool CPaintManagerUI::IsNoActivate()
+{
+    return m_bNoActivate;
+}
+
+void CPaintManagerUI::SetNoActivate(bool bNoActivate)
+{
+    m_bNoActivate = bNoActivate;
+}
+
 BYTE CPaintManagerUI::GetOpacity() const
 {
 	return m_nOpacity;
@@ -563,7 +560,7 @@ void CPaintManagerUI::SetOpacity(BYTE nOpacity)
 	m_nOpacity = nOpacity;
 	if( m_hWndPaint != NULL ) {
 		typedef BOOL (__stdcall *PFUNCSETLAYEREDWINDOWATTR)(HWND, COLORREF, BYTE, DWORD);
-		PFUNCSETLAYEREDWINDOWATTR fSetLayeredWindowAttributes;
+		PFUNCSETLAYEREDWINDOWATTR fSetLayeredWindowAttributes = NULL;
 
 		HMODULE hUser32 = ::GetModuleHandle(_T("User32.dll"));
 		if (hUser32)
@@ -579,6 +576,9 @@ void CPaintManagerUI::SetOpacity(BYTE nOpacity)
 		else dwNewStyle &= ~WS_EX_LAYERED;
 		if(dwStyle != dwNewStyle) ::SetWindowLong(m_hWndPaint, GWL_EXSTYLE, dwNewStyle);
 		fSetLayeredWindowAttributes(m_hWndPaint, 0, nOpacity, LWA_ALPHA);
+
+		m_bLayered = false;
+		Invalidate();
 	}
 }
 
@@ -650,6 +650,8 @@ LPCTSTR CPaintManagerUI::GetLayeredImage()
 void CPaintManagerUI::SetLayeredImage(LPCTSTR pstrImage)
 {
 	m_diLayered.sDrawString = pstrImage;
+	RECT rcNull = {0};
+	CRenderEngine::DrawImage(NULL, this, rcNull, rcNull, m_diLayered);
 }
 
 bool CPaintManagerUI::PreMessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LRESULT& /*lRes*/)
@@ -667,7 +669,7 @@ bool CPaintManagerUI::PreMessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam,
         {
            // Tabbing between controls
            if( wParam == VK_TAB ) {
-               if( m_pFocus && m_pFocus->IsVisible() && m_pFocus->IsEnabled() && _tcsstr(m_pFocus->GetClass(), _T("RichEditUI")) != NULL ) {
+               if( m_pFocus && m_pFocus->IsVisible() && m_pFocus->IsEnabled() && _tcsstr(m_pFocus->GetClass(), DUI_CTR_RICHEDIT) != NULL ) {
                    if( static_cast<CRichEditUI*>(m_pFocus)->IsWantTab() ) return false;
                }
                SetNextTabControl(::GetKeyState(VK_SHIFT) >= 0);
@@ -771,9 +773,7 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
     switch( uMsg ) {
     case WM_APP + 1:
         {
-            for( int i = 0; i < m_aDelayedCleanup.GetSize(); i++ ) 
-                delete static_cast<CControlUI*>(m_aDelayedCleanup[i]);
-            m_aDelayedCleanup.Empty();
+			m_bAsyncNotifyPosted = false;
 
 			TNotifyUI* pMsg = NULL;
 			while( pMsg = static_cast<TNotifyUI*>(m_aAsyncNotify.GetAt(0)) ) {
@@ -786,6 +786,10 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
 				}
 				delete pMsg;
 			}
+
+            for( int i = 0; i < m_aDelayedCleanup.GetSize(); i++ ) 
+                static_cast<CControlUI*>(m_aDelayedCleanup[i])->Delete();
+            m_aDelayedCleanup.Empty();
         }
         break;
     case WM_CLOSE:
@@ -810,11 +814,10 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
 
 			if( ::GetActiveWindow() == m_hWndPaint ) {
 				HWND hwndParent = GetWindowOwner(m_hWndPaint);
+                if ((GetWindowStyle(m_hWndPaint) & WS_CHILD) !=0 ) hwndParent = GetParent(m_hWndPaint);
 				if( hwndParent != NULL ) ::SetFocus(hwndParent);
 			}
-			if (m_hwndTooltip != NULL) //by jiangdong 修改当父窗体以成员变量形式在窗口类中存在时候,当点击父窗体关闭按钮的时候
-				                       //提示框内容还停留在页面中，没有销毁。
-			{
+			if (m_hwndTooltip != NULL) {
 				::DestroyWindow(m_hwndTooltip);
 				m_hwndTooltip = NULL;
 			}
@@ -856,7 +859,13 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
 			else {
 				if( !::GetUpdateRect(m_hWndPaint, &rcPaint, FALSE) ) return true;
 			}
+			
+            // Set focus to first control?
+            if( m_bFocusNeeded ) {
+                SetNextTabControl();
+            }
 
+			SetPainting(true);
             if( m_bUpdateNeeded ) {
                 m_bUpdateNeeded = false;
                 if( !::IsRectEmpty(&rcClient) ) {
@@ -896,6 +905,7 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
 						SendNotify(m_pRoot, DUI_MSGTYPE_WINDOWINIT,  0, 0, false);
 						if( m_bLayered && m_bLayeredChanged ) {
 							Invalidate();
+							SetPainting(false);
 							return true;
 						}
 					}
@@ -911,10 +921,6 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
 				rcRoot.bottom -= m_rcLayeredInset.bottom;
 				m_pRoot->SetPos(rcRoot, true);
 			}
-            // Set focus to first control?
-            if( m_bFocusNeeded ) {
-                SetNextTabControl();
-            }
             //
             // Render screen
             //
@@ -922,7 +928,7 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
             if( m_bOffscreenPaint && m_hbmpOffscreen == NULL )
             {
                 m_hDcOffscreen = ::CreateCompatibleDC(m_hDcPaint);
-                if( m_bLayered ) m_hbmpOffscreen = CreateARGB32Bitmap(m_hDcPaint, rcClient.right - rcClient.left, rcClient.bottom - rcClient.top, &m_pOffscreenBits); 
+				if( m_bLayered ) m_hbmpOffscreen = CRenderEngine::CreateARGB32Bitmap(m_hDcPaint, rcClient.right - rcClient.left, rcClient.bottom - rcClient.top, &m_pOffscreenBits); 
                 else m_hbmpOffscreen = ::CreateCompatibleBitmap(m_hDcPaint, rcClient.right - rcClient.left, rcClient.bottom - rcClient.top); 
                 ASSERT(m_hDcOffscreen);
                 ASSERT(m_hbmpOffscreen);
@@ -934,7 +940,52 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
             {
                 HBITMAP hOldBitmap = (HBITMAP) ::SelectObject(m_hDcOffscreen, m_hbmpOffscreen);
                 int iSaveDC = ::SaveDC(m_hDcOffscreen);
-                m_pRoot->Paint(m_hDcOffscreen, rcPaint);
+				if (m_bLayered && m_diLayered.pImageInfo == NULL) {
+					COLORREF* pOffscreenBits = NULL;
+					for( LONG y = rcClient.bottom - rcPaint.bottom; y < rcClient.bottom - rcPaint.top; ++y ) {
+						for( LONG x = rcPaint.left; x < rcPaint.right; ++x ) {
+							pOffscreenBits = m_pOffscreenBits + y*(rcClient.right - rcClient.left) + x;
+							*pOffscreenBits = 0;
+						}
+					}
+				}
+                m_pRoot->Paint(m_hDcOffscreen, rcPaint, NULL);
+
+				if( m_bLayered ) {
+					for( int i = 0; i < m_aNativeWindow.GetSize(); ) {
+						HWND hChildWnd = static_cast<HWND>(m_aNativeWindow[i]);
+						if (!::IsWindow(hChildWnd)) {
+							m_aNativeWindow.Remove(i);
+							m_aNativeWindowControl.Remove(i);
+							continue;
+						}
+						++i;
+						if (!::IsWindowVisible(hChildWnd)) continue;
+						RECT rcChildWnd = GetNativeWindowRect(hChildWnd);
+						RECT rcTemp = { 0 };
+						if( !::IntersectRect(&rcTemp, &rcPaint, &rcChildWnd) ) continue;
+
+						COLORREF* pChildBitmapBits = NULL;
+						HDC hChildMemDC = ::CreateCompatibleDC(m_hDcOffscreen);
+						HBITMAP hChildBitmap = CRenderEngine::CreateARGB32Bitmap(hChildMemDC, rcChildWnd.right-rcChildWnd.left, rcChildWnd.bottom-rcChildWnd.top, &pChildBitmapBits); 
+						::ZeroMemory(pChildBitmapBits, (rcChildWnd.right - rcChildWnd.left)*(rcChildWnd.bottom - rcChildWnd.top)*4);
+						HBITMAP hOldChildBitmap = (HBITMAP) ::SelectObject(hChildMemDC, hChildBitmap);
+						::SendMessage(hChildWnd, WM_PRINT, (WPARAM)hChildMemDC,(LPARAM)(PRF_CHECKVISIBLE|PRF_CHILDREN|PRF_CLIENT|PRF_OWNED));
+						COLORREF* pChildBitmapBit;
+						for( LONG y = 0; y < rcChildWnd.bottom-rcChildWnd.top; y++ ) {
+							for( LONG x = 0; x < rcChildWnd.right-rcChildWnd.left; x++ ) {
+								pChildBitmapBit = pChildBitmapBits+y*(rcChildWnd.right-rcChildWnd.left) + x;
+								if (*pChildBitmapBit != 0x00000000) *pChildBitmapBit |= 0xff000000;
+							}
+						}
+						::BitBlt(m_hDcOffscreen, rcChildWnd.left, rcChildWnd.top, rcChildWnd.right - rcChildWnd.left,
+							rcChildWnd.bottom - rcChildWnd.top, hChildMemDC, 0, 0, SRCCOPY);
+						::SelectObject(hChildMemDC, hOldChildBitmap);
+						::DeleteObject(hChildBitmap);
+						::DeleteDC(hChildMemDC);
+					}
+				}
+
                 for( int i = 0; i < m_aPostPaintControls.GetSize(); i++ ) {
                     CControlUI* pPostPaintControl = static_cast<CControlUI*>(m_aPostPaintControls[i]);
                     pPostPaintControl->DoPostPaint(m_hDcOffscreen, rcPaint);
@@ -950,42 +1001,45 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
                     rcLayeredClient.top += m_rcLayeredInset.top;
                     rcLayeredClient.right -= m_rcLayeredInset.right;
                     rcLayeredClient.bottom -= m_rcLayeredInset.bottom;
-                    if( m_hbmpBackground == NULL ) {
-                        m_hDcBackground = ::CreateCompatibleDC(m_hDcPaint);
-                        m_hbmpBackground = CreateARGB32Bitmap(m_hDcPaint, dwWidth, dwHeight, &m_pBackgroundBits); 
-                        ASSERT(m_hDcBackground);
-                        ASSERT(m_hbmpBackground);
-                        ::ZeroMemory(m_pBackgroundBits, dwWidth * dwHeight * 4);
-                        ::SelectObject(m_hDcBackground, m_hbmpBackground);
-                        CRenderClip clip;
-                        CRenderClip::GenerateClip(m_hDcBackground, rcLayeredClient, clip);
-                        CRenderEngine::DrawImage(m_hDcBackground, this, rcLayeredClient, rcLayeredClient, m_diLayered);
-                    }
-                    else if( m_bLayeredChanged ) {
-                        ::ZeroMemory(m_pBackgroundBits, dwWidth * dwHeight * 4);
-                        CRenderClip clip;
-                        CRenderClip::GenerateClip(m_hDcBackground, rcLayeredClient, clip);
-                        CRenderEngine::DrawImage(m_hDcBackground, this, rcLayeredClient, rcLayeredClient, m_diLayered);
-                    }
-                    COLORREF* pOffscreenBits = m_pOffscreenBits;
-                    COLORREF* pBackgroundBits = m_pBackgroundBits;
-                    BYTE A = 0;
-                    BYTE R = 0;
-                    BYTE G = 0;
-                    BYTE B = 0;
-                    if( m_diLayered.pImageInfo && m_diLayered.pImageInfo->bAlpha ) {
-                        for( LONG y = rcClient.bottom - rcPaint.bottom; y < rcClient.bottom - rcPaint.top; ++y ) {
-                            for( LONG x = rcPaint.left; x < rcPaint.right; ++x ) {
-                                pOffscreenBits = m_pOffscreenBits + y * dwWidth + x;
-                                pBackgroundBits = m_pBackgroundBits + y * dwWidth + x;
-                                A = (BYTE)((*pBackgroundBits) >> 24);
-                                R = (BYTE)((*pOffscreenBits) >> 16) * A / 255;
-                                G = (BYTE)((*pOffscreenBits) >> 8) * A / 255;
-                                B = (BYTE)(*pOffscreenBits) * A / 255;
-                                *pOffscreenBits = RGB(B, G, R) + ((DWORD)A << 24);
-                            }
-                        }
-                    }
+
+					COLORREF* pOffscreenBits = m_pOffscreenBits;
+					COLORREF* pBackgroundBits = m_pBackgroundBits;
+					BYTE A = 0;
+					BYTE R = 0;
+					BYTE G = 0;
+					BYTE B = 0;
+					if (m_diLayered.pImageInfo != NULL) {
+						if( m_hbmpBackground == NULL) {
+							m_hDcBackground = ::CreateCompatibleDC(m_hDcPaint);
+							m_hbmpBackground = CRenderEngine::CreateARGB32Bitmap(m_hDcPaint, dwWidth, dwHeight, &m_pBackgroundBits); 
+							ASSERT(m_hDcBackground);
+							ASSERT(m_hbmpBackground);
+							::ZeroMemory(m_pBackgroundBits, dwWidth * dwHeight * 4);
+							::SelectObject(m_hDcBackground, m_hbmpBackground);
+							CRenderClip clip;
+							CRenderClip::GenerateClip(m_hDcBackground, rcLayeredClient, clip);
+							CRenderEngine::DrawImage(m_hDcBackground, this, rcLayeredClient, rcLayeredClient, m_diLayered);
+						}
+						else if( m_bLayeredChanged ) {
+							::ZeroMemory(m_pBackgroundBits, dwWidth * dwHeight * 4);
+							CRenderClip clip;
+							CRenderClip::GenerateClip(m_hDcBackground, rcLayeredClient, clip);
+							CRenderEngine::DrawImage(m_hDcBackground, this, rcLayeredClient, rcLayeredClient, m_diLayered);
+						}
+						if( m_diLayered.pImageInfo->bAlpha ) {
+							for( LONG y = rcClient.bottom - rcPaint.bottom; y < rcClient.bottom - rcPaint.top; ++y ) {
+								for( LONG x = rcPaint.left; x < rcPaint.right; ++x ) {
+									pOffscreenBits = m_pOffscreenBits + y * dwWidth + x;
+									pBackgroundBits = m_pBackgroundBits + y * dwWidth + x;
+									A = (BYTE)((*pBackgroundBits) >> 24);
+									R = (BYTE)((*pOffscreenBits) >> 16) * A / 255;
+									G = (BYTE)((*pOffscreenBits) >> 8) * A / 255;
+									B = (BYTE)(*pOffscreenBits) * A / 255;
+									*pOffscreenBits = RGB(B, G, R) + ((DWORD)A << 24);
+								}
+							}
+						}
+					}
                     BLENDFUNCTION bf = { AC_SRC_OVER, 0, m_nOpacity, AC_SRC_ALPHA };
                     POINT ptPos   = { rcWnd.left, rcWnd.top };
                     SIZE sizeWnd  = { dwWidth, dwHeight };
@@ -1008,15 +1062,16 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
             {
                 // A standard paint job
                 int iSaveDC = ::SaveDC(m_hDcPaint);
-                m_pRoot->Paint(m_hDcPaint, rcPaint);
+                m_pRoot->Paint(m_hDcPaint, rcPaint, NULL);
                 ::RestoreDC(m_hDcPaint, iSaveDC);
             }
             // All Done!
             ::EndPaint(m_hWndPaint, &ps);
-        }
-		m_bLayeredChanged = false;
-        if( m_bUpdateNeeded ) Invalidate();
 
+			SetPainting(false);
+			m_bLayeredChanged = false;
+			if( m_bUpdateNeeded ) Invalidate();
+        }
         return true;
     case WM_PRINTCLIENT:
         {
@@ -1025,7 +1080,7 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
             ::GetClientRect(m_hWndPaint, &rcClient);
             HDC hDC = (HDC) wParam;
             int save = ::SaveDC(hDC);
-            m_pRoot->Paint(hDC, rcClient);
+            m_pRoot->Paint(hDC, rcClient, NULL);
             // Check for traversing children. The crux is that WM_PRINT will assume
             // that the DC is positioned at frame coordinates and will paint the child
             // control at the wrong position. We'll simulate the entire thing instead.
@@ -1098,15 +1153,23 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
             }
         }
         break;
+    case WM_MOUSEACTIVATE:
+        {
+            if (m_bNoActivate) {
+                lRes = MA_NOACTIVATE;
+                return true;
+            }
+        }
+        break;
     case WM_MOUSEHOVER:
         {
-            if( m_pRoot == NULL ) break;
+            if (m_pRoot == NULL) break;
             m_bMouseTracking = false;
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             CControlUI* pHover = FindControl(pt);
-            if( pHover == NULL ) break;
+            if (pHover == NULL) break;
             // Generate mouse hover event
-            if( m_pEventHover != NULL ) {
+            if (m_pEventHover != NULL) {
                 TEventUI event = { 0 };
                 event.Type = UIEVENT_MOUSEHOVER;
                 event.pSender = m_pEventHover;
@@ -1119,27 +1182,47 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
             }
             // Create tooltip information
             CDuiString sToolTip = pHover->GetToolTip();
-            if( sToolTip.IsEmpty() ) return true;
-			ProcessMultiLanguageTokens(sToolTip);
+            if (sToolTip.IsEmpty()) return true;
+            ProcessMultiLanguageTokens(sToolTip);
             ::ZeroMemory(&m_ToolTip, sizeof(TOOLINFO));
             m_ToolTip.cbSize = sizeof(TOOLINFO);
             m_ToolTip.uFlags = TTF_IDISHWND;
             m_ToolTip.hwnd = m_hWndPaint;
-            m_ToolTip.uId = (UINT_PTR) m_hWndPaint;
+            m_ToolTip.uId = (UINT_PTR)m_hWndPaint;
             m_ToolTip.hinst = m_hInstance;
-            m_ToolTip.lpszText = const_cast<LPTSTR>( (LPCTSTR) sToolTip );
+            m_ToolTip.lpszText = const_cast<LPTSTR>((LPCTSTR)sToolTip);
             m_ToolTip.rect = pHover->GetPos();
-            if( m_hwndTooltip == NULL ) {
+            if (m_hwndTooltip == NULL) {
                 m_hwndTooltip = ::CreateWindowEx(0, TOOLTIPS_CLASS, NULL, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, m_hWndPaint, NULL, m_hInstance, NULL);
-				if( m_hwndTooltip != NULL && m_iTooltipWidth >= 0  ) {
-					m_iTooltipWidth = (int)::SendMessage(m_hwndTooltip, TTM_SETMAXTIPWIDTH, 0, m_iTooltipWidth);
-				}
-				::SendMessage(m_hwndTooltip, TTM_ADDTOOL, 0, (LPARAM) &m_ToolTip);
+                ::SendMessage(m_hwndTooltip, TTM_ADDTOOL, 0, (LPARAM)&m_ToolTip);
+                ::SendMessage(m_hwndTooltip, TTM_SETMAXTIPWIDTH, 0, pHover->GetToolTipWidth());
+                ::SendMessage(m_hwndTooltip, TTM_SETTOOLINFO, 0, (LPARAM)&m_ToolTip);
+                ::SendMessage(m_hwndTooltip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&m_ToolTip);
+
             }
-			::SendMessage( m_hwndTooltip,TTM_SETMAXTIPWIDTH,0, pHover->GetToolTipWidth());
-            ::SendMessage(m_hwndTooltip, TTM_SETTOOLINFO, 0, (LPARAM) &m_ToolTip);
-            ::SendMessage(m_hwndTooltip, TTM_TRACKACTIVATE, TRUE, (LPARAM) &m_ToolTip);
-        }
+            // by jiangdong 2016-8-6 修改tooltip 悬停时候 闪烁bug
+            if (m_pLastToolTip == NULL) {
+                m_pLastToolTip = pHover;
+            }
+            else{
+                if (m_pLastToolTip == pHover){
+                    if (m_iLastTooltipWidth != pHover->GetToolTipWidth()){
+                        ::SendMessage(m_hwndTooltip, TTM_SETMAXTIPWIDTH, 0, pHover->GetToolTipWidth());
+                        m_iLastTooltipWidth = pHover->GetToolTipWidth();
+
+                    }
+                    ::SendMessage(m_hwndTooltip, TTM_SETTOOLINFO, 0, (LPARAM)&m_ToolTip);
+                    ::SendMessage(m_hwndTooltip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&m_ToolTip);
+                }
+                else{
+                    ::SendMessage(m_hwndTooltip, TTM_SETMAXTIPWIDTH, 0, pHover->GetToolTipWidth());
+                    ::SendMessage(m_hwndTooltip, TTM_SETTOOLINFO, 0, (LPARAM)&m_ToolTip);
+                    ::SendMessage(m_hwndTooltip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&m_ToolTip);
+                }
+            }
+            //修改在CListElementUI 有提示 子项无提示下无法跟随移动！（按理说不应该移动的）
+            ::SendMessage(m_hwndTooltip, TTM_TRACKPOSITION, 0, (LPARAM)(DWORD)MAKELONG(pt.x, pt.y));
+    }
         return true;
     case WM_MOUSELEAVE:
         {
@@ -1194,6 +1277,14 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
                 if( pNewHover != m_pEventHover && m_pEventHover != NULL ) {
                     event.Type = UIEVENT_MOUSELEAVE;
                     event.pSender = m_pEventHover;
+
+                    CDuiPtrArray aNeedMouseLeaveNeeded(m_aNeedMouseLeaveNeeded.GetSize());
+                    aNeedMouseLeaveNeeded.Resize(m_aNeedMouseLeaveNeeded.GetSize());
+                    ::CopyMemory(aNeedMouseLeaveNeeded.GetData(), m_aNeedMouseLeaveNeeded.GetData(), m_aNeedMouseLeaveNeeded.GetSize() * sizeof(LPVOID));
+                    for( int i = 0; i < aNeedMouseLeaveNeeded.GetSize(); i++ ) {
+                        static_cast<CControlUI*>(aNeedMouseLeaveNeeded[i])->Event(event);
+                    }
+
                     m_pEventHover->Event(event);
                     m_pEventHover = NULL;
                     if( m_hwndTooltip != NULL ) ::SendMessage(m_hwndTooltip, TTM_TRACKACTIVATE, FALSE, (LPARAM) &m_ToolTip);
@@ -1222,7 +1313,7 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
             // We alway set focus back to our app (this helps
             // when Win32 child windows are placed on the dialog
             // and we need to remove them on focus change).
-            ::SetFocus(m_hWndPaint);
+            if (!m_bNoActivate) ::SetFocus(m_hWndPaint);
             if( m_pRoot == NULL ) break;
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             m_ptLastMousePos = pt;
@@ -1245,7 +1336,7 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
         break;
     case WM_LBUTTONDBLCLK:
         {
-            ::SetFocus(m_hWndPaint);
+            if (!m_bNoActivate) ::SetFocus(m_hWndPaint);
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             m_ptLastMousePos = pt;
             CControlUI* pControl = FindControl(pt);
@@ -1290,14 +1381,13 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
         break;
     case WM_RBUTTONDOWN:
         {
-            ::SetFocus(m_hWndPaint);
+            if (!m_bNoActivate) ::SetFocus(m_hWndPaint);
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             m_ptLastMousePos = pt;
             CControlUI* pControl = FindControl(pt);
             if( pControl == NULL ) break;
             if( pControl->GetManager() != this ) break;
             pControl->SetFocus();
-            SetCapture();
             TEventUI event = { 0 };
             event.Type = UIEVENT_RBUTTONDOWN;
             event.pSender = pControl;
@@ -1318,7 +1408,6 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
             ::ScreenToClient(m_hWndPaint, &pt);
             m_ptLastMousePos = pt;
             if( m_pEventClick == NULL ) break;
-            ReleaseCapture();
             TEventUI event = { 0 };
             event.Type = UIEVENT_CONTEXTMENU;
             event.pSender = m_pEventClick;
@@ -1345,6 +1434,7 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
             event.pSender = pControl;
             event.wParam = MAKELPARAM(zDelta < 0 ? SB_LINEDOWN : SB_LINEUP, 0);
             event.lParam = lParam;
+			event.ptMouse = m_ptLastMousePos;
             event.wKeyState = MapKeyState();
             event.dwTimestamp = ::GetTickCount();
             pControl->Event(event);
@@ -1426,6 +1516,28 @@ bool CPaintManagerUI::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam, LR
             pControl->Event(event);
         }
         return true;
+	case WM_KILLFOCUS:
+		{
+			if( wParam != NULL ) {
+				HWND hWnd = ::GetFocus();
+				HWND hParentWnd = NULL;
+				while( hParentWnd = ::GetParent(hWnd) ) {
+					if( m_hWndPaint == hParentWnd ) {
+						for( int i = 0; i < m_aNativeWindow.GetSize(); i++ ) {
+							if( static_cast<HWND>(m_aNativeWindow[i]) == hWnd ) {
+								if( static_cast<CControlUI*>(m_aNativeWindowControl[i]) != m_pFocus ) {
+									SetFocus(static_cast<CControlUI*>(m_aNativeWindowControl[i]), false);
+								}
+								break;
+							}
+						}
+						break;
+					}
+					hWnd = hParentWnd;
+				}
+			}
+		}
+		break;
     case WM_NOTIFY:
         {
             LPNMHDR lpNMHDR = (LPNMHDR) lParam;
@@ -1497,11 +1609,18 @@ bool CPaintManagerUI::AttachDialog(CControlUI* pControl)
     m_pEventKey = NULL;
     m_pEventHover = NULL;
     m_pEventClick = NULL;
+    m_pLastToolTip = NULL;
     // Remove the existing control-tree. We might have gotten inside this function as
     // a result of an event fired or similar, so we cannot just delete the objects and
     // pull the internal memory of the calling code. We'll delay the cleanup.
     if( m_pRoot != NULL ) {
+        for( int i = 0; i < m_aDelayedCleanup.GetSize(); i++ ) static_cast<CControlUI*>(m_aDelayedCleanup[i])->Delete();
+        m_aDelayedCleanup.Empty();
+        for( int i = 0; i < m_aAsyncNotify.GetSize(); i++ ) delete static_cast<TNotifyUI*>(m_aAsyncNotify[i]);
+        m_aAsyncNotify.Empty();
+        m_mNameHash.Resize(0);
         m_aPostPaintControls.Empty();
+		m_aNativeWindow.Empty();
         AddDelayedCleanup(m_pRoot);
     }
     // Set the dialog root element
@@ -1521,6 +1640,18 @@ bool CPaintManagerUI::InitControls(CControlUI* pControl, CControlUI* pParent /*=
     pControl->SetManager(this, pParent != NULL ? pParent : pControl->GetParent(), true);
     pControl->FindControl(__FindControlFromNameHash, this, UIFIND_ALL);
     return true;
+}
+
+bool CPaintManagerUI::RenameControl(CControlUI* pControl, LPCTSTR pstrName)
+{
+	ASSERT(pControl);
+	if( pControl == NULL || pControl->GetManager() != this || pstrName == NULL || *pstrName == _T('\0')) return false;
+	if (pControl->GetName() == pstrName) return true;
+	if (NULL != FindControl(pstrName)) return false;
+	m_mNameHash.Remove(pControl->GetName());
+	bool bResult = m_mNameHash.Insert(pstrName, pControl);
+	if (bResult) pControl->SetName(pstrName);
+	return bResult;
 }
 
 void CPaintManagerUI::ReapObjects(CControlUI* pControl)
@@ -1543,9 +1674,11 @@ void CPaintManagerUI::ReapObjects(CControlUI* pControl)
 
 bool CPaintManagerUI::AddOptionGroup(LPCTSTR pStrGroupName, CControlUI* pControl)
 {
+    if (pControl == NULL || pStrGroupName == NULL) return false;
+
     LPVOID lp = m_mOptionGroup.Find(pStrGroupName);
     if( lp ) {
-        CStdPtrArray* aOptionGroup = static_cast<CStdPtrArray*>(lp);
+        CDuiPtrArray* aOptionGroup = static_cast<CDuiPtrArray*>(lp);
         for( int i = 0; i < aOptionGroup->GetSize(); i++ ) {
             if( static_cast<CControlUI*>(aOptionGroup->GetAt(i)) == pControl ) {
                 return false;
@@ -1554,17 +1687,17 @@ bool CPaintManagerUI::AddOptionGroup(LPCTSTR pStrGroupName, CControlUI* pControl
         aOptionGroup->Add(pControl);
     }
     else {
-        CStdPtrArray* aOptionGroup = new CStdPtrArray(6);
+        CDuiPtrArray* aOptionGroup = new CDuiPtrArray(6);
         aOptionGroup->Add(pControl);
         m_mOptionGroup.Insert(pStrGroupName, aOptionGroup);
     }
     return true;
 }
 
-CStdPtrArray* CPaintManagerUI::GetOptionGroup(LPCTSTR pStrGroupName)
+CDuiPtrArray* CPaintManagerUI::GetOptionGroup(LPCTSTR pStrGroupName)
 {
     LPVOID lp = m_mOptionGroup.Find(pStrGroupName);
-    if( lp ) return static_cast<CStdPtrArray*>(lp);
+    if( lp ) return static_cast<CDuiPtrArray*>(lp);
     return NULL;
 }
 
@@ -1572,7 +1705,7 @@ void CPaintManagerUI::RemoveOptionGroup(LPCTSTR pStrGroupName, CControlUI* pCont
 {
 	LPVOID lp = m_mOptionGroup.Find(pStrGroupName);
 	if( lp ) {
-		CStdPtrArray* aOptionGroup = static_cast<CStdPtrArray*>(lp);
+		CDuiPtrArray* aOptionGroup = static_cast<CDuiPtrArray*>(lp);
 		if( aOptionGroup == NULL ) return;
 		for( int i = 0; i < aOptionGroup->GetSize(); i++ ) {
 			if( static_cast<CControlUI*>(aOptionGroup->GetAt(i)) == pControl ) {
@@ -1589,17 +1722,17 @@ void CPaintManagerUI::RemoveOptionGroup(LPCTSTR pStrGroupName, CControlUI* pCont
 
 void CPaintManagerUI::RemoveAllOptionGroups()
 {
-	CStdPtrArray* aOptionGroup;
+	CDuiPtrArray* aOptionGroup;
 	for( int i = 0; i< m_mOptionGroup.GetSize(); i++ ) {
 		if(LPCTSTR key = m_mOptionGroup.GetAt(i)) {
-			aOptionGroup = static_cast<CStdPtrArray*>(m_mOptionGroup.Find(key));
+			aOptionGroup = static_cast<CDuiPtrArray*>(m_mOptionGroup.Find(key));
 			delete aOptionGroup;
 		}
 	}
 	m_mOptionGroup.RemoveAll();
 }
 
-void CPaintManagerUI::MessageLoop()
+int CPaintManagerUI::MessageLoop()
 {
     MSG msg = { 0 };
     while( ::GetMessage(&msg, NULL, 0, 0) ) {
@@ -1616,6 +1749,7 @@ void CPaintManagerUI::MessageLoop()
 			//}
         }
     }
+    return msg.wParam;
 }
 
 void CPaintManagerUI::Term()
@@ -1631,11 +1765,11 @@ CControlUI* CPaintManagerUI::GetFocus() const
     return m_pFocus;
 }
 
-void CPaintManagerUI::SetFocus(CControlUI* pControl)
+void CPaintManagerUI::SetFocus(CControlUI* pControl, bool bFocusWnd)
 {
     // Paint manager window has focus?
     HWND hFocusWnd = ::GetFocus();
-    if( hFocusWnd != m_hWndPaint && pControl != m_pFocus ) ::SetFocus(m_hWndPaint);
+    if( bFocusWnd && hFocusWnd != m_hWndPaint && pControl != m_pFocus && !m_bNoActivate) ::SetFocus(m_hWndPaint);
     // Already has focus?
     if( pControl == m_pFocus ) return;
     // Remove focus from old control
@@ -1668,7 +1802,7 @@ void CPaintManagerUI::SetFocus(CControlUI* pControl)
 
 void CPaintManagerUI::SetFocusNeeded(CControlUI* pControl)
 {
-    ::SetFocus(m_hWndPaint);
+    if (!m_bNoActivate) ::SetFocus(m_hWndPaint);
     if( pControl == NULL ) return;
     if( m_pFocus != NULL ) {
         TEventUI event = { 0 };
@@ -1785,6 +1919,17 @@ bool CPaintManagerUI::IsCaptured()
     return m_bMouseCapture;
 }
 
+
+bool CPaintManagerUI::IsPainting()
+{
+	return m_bIsPainting;
+}
+
+void CPaintManagerUI::SetPainting(bool bIsPainting)
+{
+	m_bIsPainting = bIsPainting;
+}
+
 bool CPaintManagerUI::SetNextTabControl(bool bForward)
 {
     // If we're in the process of restructuring the layout we can delay the
@@ -1818,6 +1963,8 @@ bool CPaintManagerUI::SetNextTabControl(bool bForward)
 
 bool CPaintManagerUI::AddNotifier(INotifyUI* pNotifier)
 {
+    if (pNotifier == NULL) return false;
+
     ASSERT(m_aNotifiers.Find(pNotifier)<0);
     return m_aNotifiers.Add(pNotifier);
 }
@@ -1834,6 +1981,8 @@ bool CPaintManagerUI::RemoveNotifier(INotifyUI* pNotifier)
 
 bool CPaintManagerUI::AddPreMessageFilter(IMessageFilterUI* pFilter)
 {
+    if (pFilter == NULL) return false;
+
     ASSERT(m_aPreMessageFilters.Find(pFilter)<0);
     return m_aPreMessageFilters.Add(pFilter);
 }
@@ -1850,6 +1999,8 @@ bool CPaintManagerUI::RemovePreMessageFilter(IMessageFilterUI* pFilter)
 
 bool CPaintManagerUI::AddMessageFilter(IMessageFilterUI* pFilter)
 {
+    if (pFilter == NULL) return false;
+
     ASSERT(m_aMessageFilters.Find(pFilter)<0);
     return m_aMessageFilters.Add(pFilter);
 }
@@ -1871,6 +2022,8 @@ int CPaintManagerUI::GetPostPaintCount() const
 
 bool CPaintManagerUI::AddPostPaint(CControlUI* pControl)
 {
+    if (pControl == NULL) return false;
+
     ASSERT(m_aPostPaintControls.Find(pControl) < 0);
     return m_aPostPaintControls.Add(pControl);
 }
@@ -1887,28 +2040,96 @@ bool CPaintManagerUI::RemovePostPaint(CControlUI* pControl)
 
 bool CPaintManagerUI::SetPostPaintIndex(CControlUI* pControl, int iIndex)
 {
+    if (pControl == NULL) return false;
+
     RemovePostPaint(pControl);
     return m_aPostPaintControls.InsertAt(iIndex, pControl);
 }
 
-void CPaintManagerUI::AddDelayedCleanup(CControlUI* pControl)
+int CPaintManagerUI::GetNativeWindowCount() const
 {
-    pControl->SetManager(this, NULL, false);
-    m_aDelayedCleanup.Add(pControl);
-    ::PostMessage(m_hWndPaint, WM_APP + 1, 0, 0L);
+	return m_aNativeWindow.GetSize();
 }
 
-void CPaintManagerUI::SendNotify(CControlUI* pControl, LPCTSTR pstrMessage, WPARAM wParam /*= 0*/, LPARAM lParam /*= 0*/, bool bAsync /*= false*/)
+RECT CPaintManagerUI::GetNativeWindowRect(HWND hChildWnd)
+{
+	RECT rcChildWnd;
+	::GetWindowRect(hChildWnd, &rcChildWnd);
+	::ScreenToClient(m_hWndPaint, (LPPOINT)(&rcChildWnd));
+	::ScreenToClient(m_hWndPaint, (LPPOINT)(&rcChildWnd)+1);
+	return rcChildWnd;
+}
+
+bool CPaintManagerUI::AddNativeWindow(CControlUI* pControl, HWND hChildWnd)
+{
+    if (pControl == NULL || hChildWnd == NULL) return false;
+
+	RECT rcChildWnd = GetNativeWindowRect(hChildWnd);
+	Invalidate(rcChildWnd);
+
+	if (m_aNativeWindow.Find(hChildWnd) >= 0) return false;
+	if (m_aNativeWindow.Add(hChildWnd)) {
+		m_aNativeWindowControl.Add(pControl);
+		return true;
+	}
+	return false;
+}
+
+bool CPaintManagerUI::RemoveNativeWindow(HWND hChildWnd)
+{
+	for( int i = 0; i < m_aNativeWindow.GetSize(); i++ ) {
+		if( static_cast<HWND>(m_aNativeWindow[i]) == hChildWnd ) {
+			if( m_aNativeWindow.Remove(i) ) {
+				m_aNativeWindowControl.Remove(i);
+				return true;
+			}
+			return false;
+		}
+	}
+	return false;
+}
+
+void CPaintManagerUI::AddDelayedCleanup(CControlUI* pControl)
+{
+    if (pControl == NULL) return;
+    pControl->SetManager(this, NULL, false);
+    m_aDelayedCleanup.Add(pControl);
+	PostAsyncNotify();
+}
+
+void CPaintManagerUI::AddMouseLeaveNeeded(CControlUI* pControl)
+{
+    if (pControl == NULL) return;
+    for( int i = 0; i < m_aNeedMouseLeaveNeeded.GetSize(); i++ ) {
+        if( static_cast<CControlUI*>(m_aNeedMouseLeaveNeeded[i]) == pControl ) {
+            return;
+        }
+    }
+    m_aNeedMouseLeaveNeeded.Add(pControl);
+}
+
+bool CPaintManagerUI::RemoveMouseLeaveNeeded(CControlUI* pControl)
+{
+    if (pControl == NULL) return false;
+    for( int i = 0; i < m_aNeedMouseLeaveNeeded.GetSize(); i++ ) {
+        if( static_cast<CControlUI*>(m_aNeedMouseLeaveNeeded[i]) == pControl ) {
+            return m_aNeedMouseLeaveNeeded.Remove(i);
+        }
+    }
+    return false;
+}
+
+void CPaintManagerUI::SendNotify(CControlUI* pControl, LPCTSTR pstrMessage, WPARAM wParam /*= 0*/, LPARAM lParam /*= 0*/, bool bAsync /*= false*/, bool bEnableRepeat /*= true*/)
 {
     TNotifyUI Msg;
     Msg.pSender = pControl;
     Msg.sType = pstrMessage;
     Msg.wParam = wParam;
     Msg.lParam = lParam;
-    SendNotify(Msg, bAsync);
+    SendNotify(Msg, bAsync, bEnableRepeat);
 }
 
-void CPaintManagerUI::SendNotify(TNotifyUI& Msg, bool bAsync /*= false*/)
+void CPaintManagerUI::SendNotify(TNotifyUI& Msg, bool bAsync /*= false*/, bool bEnableRepeat /*= true*/)
 {
     Msg.ptMouse = m_ptLastMousePos;
     Msg.dwTimestamp = ::GetTickCount();
@@ -1927,16 +2148,42 @@ void CPaintManagerUI::SendNotify(TNotifyUI& Msg, bool bAsync /*= false*/)
         }
     }
     else {
-        TNotifyUI *pMsg = new TNotifyUI;
-        pMsg->pSender = Msg.pSender;
-        pMsg->sType = Msg.sType;
-        pMsg->wParam = Msg.wParam;
-        pMsg->lParam = Msg.lParam;
-        pMsg->ptMouse = Msg.ptMouse;
-        pMsg->dwTimestamp = Msg.dwTimestamp;
-        m_aAsyncNotify.Add(pMsg);
-		::PostMessage(m_hWndPaint, WM_APP + 1, 0, 0L);
+		if( !bEnableRepeat ) {
+			for( int i = 0; i < m_aAsyncNotify.GetSize(); i++ ) {
+				TNotifyUI* pMsg = static_cast<TNotifyUI*>(m_aAsyncNotify[i]);
+				if( pMsg->pSender == Msg.pSender && pMsg->sType == Msg.sType) {
+                    if (m_bUsedVirtualWnd) pMsg->sVirtualWnd = Msg.sVirtualWnd;
+					pMsg->wParam = Msg.wParam;
+					pMsg->lParam = Msg.lParam;
+					pMsg->ptMouse = Msg.ptMouse;
+					pMsg->dwTimestamp = Msg.dwTimestamp;
+					return;
+				}
+			}
+		}
+
+		TNotifyUI *pMsg = new TNotifyUI;
+        if (m_bUsedVirtualWnd) pMsg->sVirtualWnd = Msg.sVirtualWnd;
+		pMsg->pSender = Msg.pSender;
+		pMsg->sType = Msg.sType;
+		pMsg->wParam = Msg.wParam;
+		pMsg->lParam = Msg.lParam;
+		pMsg->ptMouse = Msg.ptMouse;
+		pMsg->dwTimestamp = Msg.dwTimestamp;
+		m_aAsyncNotify.Add(pMsg);
+
+		PostAsyncNotify();
     }
+}
+
+bool CPaintManagerUI::IsForceUseSharedRes() const
+{
+	return m_bForceUseSharedRes;
+}
+
+void CPaintManagerUI::SetForceUseSharedRes(bool bForce)
+{
+	m_bForceUseSharedRes = bForce;
 }
 
 DWORD CPaintManagerUI::GetDefaultDisabledColor() const
@@ -2143,7 +2390,7 @@ HFONT CPaintManagerUI::AddFont(int id, LPCTSTR pStrFontName, int nSize, bool bBo
 	TCHAR idBuffer[16];
 	::ZeroMemory(idBuffer, sizeof(idBuffer));
 	_itot(id, idBuffer, 10);
-	if (bShared)
+	if (bShared || m_bForceUseSharedRes)
 	{
 		TFontInfo* pOldFontInfo = static_cast<TFontInfo*>(m_SharedResInfo.m_CustomFonts.Find(idBuffer));
 		if (pOldFontInfo)
@@ -2430,7 +2677,8 @@ const TImageInfo* CPaintManagerUI::GetImageEx(LPCTSTR bitmap, LPCTSTR type, DWOR
     const TImageInfo* data = GetImage(bitmap);
     if( !data ) {
         if( AddImage(bitmap, type, mask, bUseHSL, false) ) {
-            data = static_cast<TImageInfo*>(m_ResInfo.m_ImageHash.Find(bitmap));
+			if (m_bForceUseSharedRes) data = static_cast<TImageInfo*>(m_SharedResInfo.m_ImageHash.Find(bitmap));
+			else data = static_cast<TImageInfo*>(m_ResInfo.m_ImageHash.Find(bitmap)); 
         }
     }
 
@@ -2447,6 +2695,9 @@ const TImageInfo* CPaintManagerUI::AddImage(LPCTSTR bitmap, LPCTSTR type, DWORD 
             LPTSTR pstr = NULL;
             int iIndex = _tcstol(bitmap, &pstr, 10);
             data = CRenderEngine::LoadImage(iIndex, type, mask);
+        }
+        else {
+            data = CRenderEngine::LoadImage(bitmap, type, mask);
         }
     }
     else {
@@ -2465,7 +2716,7 @@ const TImageInfo* CPaintManagerUI::AddImage(LPCTSTR bitmap, LPCTSTR type, DWORD 
 	if( m_bUseHSL ) CRenderEngine::AdjustImage(true, data, m_H, m_S, m_L);
 	if (data)
 	{
-		if (bShared)
+		if (bShared || m_bForceUseSharedRes)
 		{
             TImageInfo* pOldImageInfo = static_cast<TImageInfo*>(m_SharedResInfo.m_ImageHash.Find(bitmap));
             if (pOldImageInfo)
@@ -2515,7 +2766,7 @@ const TImageInfo* CPaintManagerUI::AddImage(LPCTSTR bitmap, HBITMAP hBitmap, int
 	//data->sResType = _T("");
 	data->dwMask = 0;
 
-	if (bShared)
+	if (bShared || m_bForceUseSharedRes)
 	{
 		if( !m_SharedResInfo.m_ImageHash.Insert(bitmap, data) ) {
 			CRenderEngine::FreeImage(data);
@@ -2613,6 +2864,14 @@ void CPaintManagerUI::AdjustImagesHSL()
 	Invalidate();
 }
 
+void CPaintManagerUI::PostAsyncNotify()
+{
+	if (!m_bAsyncNotifyPosted) {
+		::PostMessage(m_hWndPaint, WM_APP + 1, 0, 0L);
+		m_bAsyncNotifyPosted = true;
+	}
+}
+
 void CPaintManagerUI::ReloadSharedImages()
 {
 	TImageInfo* data;
@@ -2626,6 +2885,9 @@ void CPaintManagerUI::ReloadSharedImages()
 						LPTSTR pstr = NULL;
 						int iIndex = _tcstol(bitmap, &pstr, 10);
 						pNewData = CRenderEngine::LoadImage(iIndex, data->sResType.GetData(), data->dwMask);
+					}
+					else {
+						pNewData = CRenderEngine::LoadImage(bitmap, data->sResType.GetData(), data->dwMask);
 					}
 				}
 				else {
@@ -2667,6 +2929,9 @@ void CPaintManagerUI::ReloadImages()
 						int iIndex = _tcstol(bitmap, &pstr, 10);
 						pNewData = CRenderEngine::LoadImage(iIndex, data->sResType.GetData(), data->dwMask);
 					}
+					else {
+						pNewData = CRenderEngine::LoadImage(bitmap, data->sResType.GetData(), data->dwMask);
+					}
 				}
 				else {
 					pNewData = CRenderEngine::LoadImage(bitmap, NULL, data->dwMask);
@@ -2696,7 +2961,7 @@ void CPaintManagerUI::ReloadImages()
 
 void CPaintManagerUI::AddDefaultAttributeList(LPCTSTR pStrControlName, LPCTSTR pStrControlAttrList, bool bShared)
 {
-	if (bShared)
+	if (bShared || m_bForceUseSharedRes)
 	{
 		CDuiString* pDefaultAttr = new CDuiString(pStrControlAttrList);
 		if (pDefaultAttr != NULL)
@@ -2775,8 +3040,8 @@ void CPaintManagerUI::AddWindowCustomAttribute(LPCTSTR pstrName, LPCTSTR pstrAtt
 	if( pstrName == NULL || pstrName[0] == _T('\0') || pstrAttr == NULL || pstrAttr[0] == _T('\0') ) return;
 	CDuiString* pCostomAttr = new CDuiString(pstrAttr);
 	if (pCostomAttr != NULL) {
-		if (m_mWindowCustomAttrHash.Find(pstrName) == NULL)
-			m_mWindowCustomAttrHash.Set(pstrName, (LPVOID)pCostomAttr);
+		if (m_mWindowAttrHash.Find(pstrName) == NULL)
+			m_mWindowAttrHash.Set(pstrName, (LPVOID)pCostomAttr);
 		else
 			delete pCostomAttr;
 	}
@@ -2785,7 +3050,7 @@ void CPaintManagerUI::AddWindowCustomAttribute(LPCTSTR pstrName, LPCTSTR pstrAtt
 LPCTSTR CPaintManagerUI::GetWindowCustomAttribute(LPCTSTR pstrName) const
 {
 	if( pstrName == NULL || pstrName[0] == _T('\0') ) return NULL;
-	CDuiString* pCostomAttr = static_cast<CDuiString*>(m_mWindowCustomAttrHash.Find(pstrName));
+	CDuiString* pCostomAttr = static_cast<CDuiString*>(m_mWindowAttrHash.Find(pstrName));
 	if( pCostomAttr ) return pCostomAttr->GetData();
 	return NULL;
 }
@@ -2793,23 +3058,226 @@ LPCTSTR CPaintManagerUI::GetWindowCustomAttribute(LPCTSTR pstrName) const
 bool CPaintManagerUI::RemoveWindowCustomAttribute(LPCTSTR pstrName)
 {
 	if( pstrName == NULL || pstrName[0] == _T('\0') ) return NULL;
-	CDuiString* pCostomAttr = static_cast<CDuiString*>(m_mWindowCustomAttrHash.Find(pstrName));
+	CDuiString* pCostomAttr = static_cast<CDuiString*>(m_mWindowAttrHash.Find(pstrName));
 	if( !pCostomAttr ) return false;
 
 	delete pCostomAttr;
-	return m_mWindowCustomAttrHash.Remove(pstrName);
+	return m_mWindowAttrHash.Remove(pstrName);
 }
 
 void CPaintManagerUI::RemoveAllWindowCustomAttribute()
 {
 	CDuiString* pCostomAttr;
-	for( int i = 0; i< m_mWindowCustomAttrHash.GetSize(); i++ ) {
-		if(LPCTSTR key = m_mWindowCustomAttrHash.GetAt(i)) {
-			pCostomAttr = static_cast<CDuiString*>(m_mWindowCustomAttrHash.Find(key));
+	for( int i = 0; i< m_mWindowAttrHash.GetSize(); i++ ) {
+		if(LPCTSTR key = m_mWindowAttrHash.GetAt(i)) {
+			pCostomAttr = static_cast<CDuiString*>(m_mWindowAttrHash.Find(key));
 			delete pCostomAttr;
 		}
 	}
-	m_mWindowCustomAttrHash.Resize();
+	m_mWindowAttrHash.Resize();
+}
+
+CDuiString CPaintManagerUI::GetWindowAttribute(LPCTSTR pstrName)
+{
+    return _T("");
+}
+
+void CPaintManagerUI::SetWindowAttribute(LPCTSTR pstrName, LPCTSTR pstrValue)
+{
+    if( _tcsicmp(pstrName, _T("size")) == 0 ) {
+        LPTSTR pstr = NULL;
+        int cx = _tcstol(pstrValue, &pstr, 10);  ASSERT(pstr);    
+        int cy = _tcstol(pstr + 1, &pstr, 10);    ASSERT(pstr); 
+        SetInitSize(cx, cy);
+    } 
+    else if( _tcsicmp(pstrName, _T("sizebox")) == 0 ) {
+        RECT rcSizeBox = { 0 };
+        LPTSTR pstr = NULL;
+        rcSizeBox.left = _tcstol(pstrValue, &pstr, 10);  ASSERT(pstr);    
+        rcSizeBox.top = _tcstol(pstr + 1, &pstr, 10);    ASSERT(pstr);    
+        rcSizeBox.right = _tcstol(pstr + 1, &pstr, 10);  ASSERT(pstr);    
+        rcSizeBox.bottom = _tcstol(pstr + 1, &pstr, 10); ASSERT(pstr);    
+        SetSizeBox(rcSizeBox);
+    }
+    else if( _tcsicmp(pstrName, _T("caption")) == 0 ) {
+        RECT rcCaption = { 0 };
+        LPTSTR pstr = NULL;
+        rcCaption.left = _tcstol(pstrValue, &pstr, 10);  ASSERT(pstr);    
+        rcCaption.top = _tcstol(pstr + 1, &pstr, 10);    ASSERT(pstr);    
+        rcCaption.right = _tcstol(pstr + 1, &pstr, 10);  ASSERT(pstr);    
+        rcCaption.bottom = _tcstol(pstr + 1, &pstr, 10); ASSERT(pstr);    
+        SetCaptionRect(rcCaption);
+    }
+    else if( _tcsicmp(pstrName, _T("roundcorner")) == 0 ) {
+        LPTSTR pstr = NULL;
+        int cx = _tcstol(pstrValue, &pstr, 10);  ASSERT(pstr);    
+        int cy = _tcstol(pstr + 1, &pstr, 10);    ASSERT(pstr); 
+        SetRoundCorner(cx, cy);
+    } 
+    else if( _tcsicmp(pstrName, _T("mininfo")) == 0 ) {
+        LPTSTR pstr = NULL;
+        int cx = _tcstol(pstrValue, &pstr, 10);  ASSERT(pstr);    
+        int cy = _tcstol(pstr + 1, &pstr, 10);    ASSERT(pstr); 
+        SetMinInfo(cx, cy);
+    }
+    else if( _tcsicmp(pstrName, _T("maxinfo")) == 0 ) {
+        LPTSTR pstr = NULL;
+        int cx = _tcstol(pstrValue, &pstr, 10);  ASSERT(pstr);    
+        int cy = _tcstol(pstr + 1, &pstr, 10);    ASSERT(pstr); 
+        SetMaxInfo(cx, cy);
+    }
+    else if( _tcsicmp(pstrName, _T("showdirty")) == 0 ) {
+        SetShowUpdateRect(_tcsicmp(pstrValue, _T("true")) == 0);
+    } 
+    else if( _tcscmp(pstrName, _T("noactivate")) == 0 ) {
+        SetNoActivate(_tcsicmp(pstrValue, _T("true")) == 0);
+    }
+    else if( _tcsicmp(pstrName, _T("opacity")) == 0 ) {
+        SetOpacity(_ttoi(pstrValue));
+    } 
+    else if( _tcscmp(pstrName, _T("layeredopacity")) == 0 ) {
+        SetLayeredOpacity(_ttoi(pstrValue));
+    } 
+    else if( _tcscmp(pstrName, _T("layeredimage")) == 0 ) {
+        SetLayered(true);
+        SetLayeredImage(pstrValue);
+    } 
+    else if( _tcsicmp(pstrName, _T("disabledfontcolor")) == 0 ) {
+        if( *pstrValue == _T('#')) pstrValue = ::CharNext(pstrValue);
+        LPTSTR pstr = NULL;
+        DWORD clrColor = _tcstoul(pstrValue, &pstr, 16);
+        SetDefaultDisabledColor(clrColor);
+    } 
+    else if( _tcsicmp(pstrName, _T("defaultfontcolor")) == 0 ) {
+        if( *pstrValue == _T('#')) pstrValue = ::CharNext(pstrValue);
+        LPTSTR pstr = NULL;
+        DWORD clrColor = _tcstoul(pstrValue, &pstr, 16);
+        SetDefaultFontColor(clrColor);
+    }
+    else if( _tcsicmp(pstrName, _T("linkfontcolor")) == 0 ) {
+        if( *pstrValue == _T('#')) pstrValue = ::CharNext(pstrValue);
+        LPTSTR pstr = NULL;
+        DWORD clrColor = _tcstoul(pstrValue, &pstr, 16);
+        SetDefaultLinkFontColor(clrColor);
+    } 
+    else if( _tcsicmp(pstrName, _T("linkhoverfontcolor")) == 0 ) {
+        if( *pstrValue == _T('#')) pstrValue = ::CharNext(pstrValue);
+        LPTSTR pstr = NULL;
+        DWORD clrColor = _tcstoul(pstrValue, &pstr, 16);
+        SetDefaultLinkHoverFontColor(clrColor);
+    } 
+    else if( _tcsicmp(pstrName, _T("selectedcolor")) == 0 ) {
+        if( *pstrValue == _T('#')) pstrValue = ::CharNext(pstrValue);
+        LPTSTR pstr = NULL;
+        DWORD clrColor = _tcstoul(pstrValue, &pstr, 16);
+        SetDefaultSelectedBkColor(clrColor);
+    } 
+    else 
+        AddWindowCustomAttribute(pstrName, pstrValue);
+}
+
+CDuiString CPaintManagerUI::GetWindowAttributeList(bool bIgnoreDefault)
+{
+    return _T("");
+}
+
+void CPaintManagerUI::SetWindowAttributeList(LPCTSTR pstrList)
+{
+    CDuiString sItem;
+    CDuiString sValue;
+    while( *pstrList != _T('\0') ) {
+        sItem.Empty();
+        sValue.Empty();
+        while( *pstrList != _T('\0') && *pstrList != _T('=') ) {
+            LPTSTR pstrTemp = ::CharNext(pstrList);
+            while( pstrList < pstrTemp) {
+                sItem += *pstrList++;
+            }
+        }
+        ASSERT( *pstrList == _T('=') );
+        if( *pstrList++ != _T('=') ) return;
+        ASSERT( *pstrList == _T('\"') );
+        if( *pstrList++ != _T('\"') ) return;
+        while( *pstrList != _T('\0') && *pstrList != _T('\"') ) {
+            LPTSTR pstrTemp = ::CharNext(pstrList);
+            while( pstrList < pstrTemp) {
+                sValue += *pstrList++;
+            }
+        }
+        ASSERT( *pstrList == _T('\"') );
+        if( *pstrList++ != _T('\"') ) return;
+        SetWindowAttribute(sItem, sValue);
+        if( *pstrList++ != _T(' ') ) return;
+    }
+}
+
+bool CPaintManagerUI::RemoveWindowAttribute(LPCTSTR pstrName)
+{
+    return false;
+}
+
+CDuiString CPaintManagerUI::GetWindowXML()
+{
+    CDuiString sWindowXML;
+    sWindowXML.Append(_T("<Window "));
+
+    // Window
+
+    // font
+    //TFontInfo* pFontInfo;
+    //for( int i = 0; i< m_SharedResInfo.m_CustomFonts.GetSize(); i++ ) {
+    //    if(LPCTSTR key = m_SharedResInfo.m_CustomFonts.GetAt(i)) {
+    //        pFontInfo = static_cast<CDuiString*>(m_SharedResInfo.m_CustomFonts.Find(key))->GetData();
+    //        sWindowXML.Append(_T("\n\t<Font shared=\"true\" id=\" "));
+    //        sWindowXML.Append(key);
+    //        sWindowXML.Append(_T("\" value=\" "));
+    //        sWindowXML.Append(sDefaultAttr.GetData());
+    //        sWindowXML.Append(_T("\" />"));
+    //    }
+    //}
+    //for( int i = 0; i< m_ResInfo.m_CustomFonts.GetSize(); i++ ) {
+    //    if(LPCTSTR key = m_ResInfo.m_CustomFonts.GetAt(i)) {
+    //        sDefaultAttr = static_cast<CDuiString*>(m_ResInfo.m_CustomFonts.Find(key))->GetData();
+    //        sDefaultAttr.Replace(_T("\""), _T("&quot;"));
+    //        sWindowXML.Append(_T("\n\t<Default name=\" "));
+    //        sWindowXML.Append(key);
+    //        sWindowXML.Append(_T("\" value=\" "));
+    //        sWindowXML.Append(sDefaultAttr.GetData());
+    //        sWindowXML.Append(_T("\" />"));
+    //    }
+    //}
+
+    // image
+
+    // MultiLanguage
+
+    // Default
+    CDuiString sDefaultAttr;
+    for( int i = 0; i< m_SharedResInfo.m_AttrHash.GetSize(); i++ ) {
+        if(LPCTSTR key = m_SharedResInfo.m_AttrHash.GetAt(i)) {
+            sDefaultAttr = static_cast<CDuiString*>(m_SharedResInfo.m_AttrHash.Find(key))->GetData();
+            sDefaultAttr.Replace(_T("\""), _T("&quot;"));
+            sWindowXML.Append(_T("\n\t<Default shared=\"true\" name=\" "));
+            sWindowXML.Append(key);
+            sWindowXML.Append(_T("\" value=\" "));
+            sWindowXML.Append(sDefaultAttr.GetData());
+            sWindowXML.Append(_T("\" />"));
+        }
+    }
+    for( int i = 0; i< m_ResInfo.m_AttrHash.GetSize(); i++ ) {
+        if(LPCTSTR key = m_ResInfo.m_AttrHash.GetAt(i)) {
+            sDefaultAttr = static_cast<CDuiString*>(m_ResInfo.m_AttrHash.Find(key))->GetData();
+            sDefaultAttr.Replace(_T("\""), _T("&quot;"));
+            sWindowXML.Append(_T("\n\t<Default name=\" "));
+            sWindowXML.Append(key);
+            sWindowXML.Append(_T("\" value=\" "));
+            sWindowXML.Append(sDefaultAttr.GetData());
+            sWindowXML.Append(_T("\" />"));
+        }
+    }
+
+    // Controls
+    return _T("");
 }
 
 void CPaintManagerUI::AddMultiLanguageString(int id, LPCTSTR pStrMultiLanguage)
@@ -2920,7 +3388,7 @@ CControlUI* CPaintManagerUI::FindSubControlByClass(CControlUI* pParent, LPCTSTR 
     return pParent->FindControl(__FindControlFromClass, (LPVOID)pstrClass, UIFIND_ALL);
 }
 
-CStdPtrArray* CPaintManagerUI::FindSubControlsByClass(CControlUI* pParent, LPCTSTR pstrClass)
+CDuiPtrArray* CPaintManagerUI::FindSubControlsByClass(CControlUI* pParent, LPCTSTR pstrClass)
 {
     if( pParent == NULL ) pParent = GetRoot();
     ASSERT(pParent);
@@ -2929,7 +3397,7 @@ CStdPtrArray* CPaintManagerUI::FindSubControlsByClass(CControlUI* pParent, LPCTS
     return &m_aFoundControls;
 }
 
-CStdPtrArray* CPaintManagerUI::GetFoundControls()
+CDuiPtrArray* CPaintManagerUI::GetFoundControls()
 {
     return &m_aFoundControls;
 }
@@ -2976,7 +3444,7 @@ CControlUI* CALLBACK CPaintManagerUI::__FindControlFromShortcut(CControlUI* pThi
     if( !pThis->IsVisible() ) return NULL; 
     FINDSHORTCUT* pFS = static_cast<FINDSHORTCUT*>(pData);
     if( pFS->ch == toupper(pThis->GetShortcut()) ) pFS->bPickNext = true;
-    if( _tcsstr(pThis->GetClass(), _T("LabelUI")) != NULL ) return NULL;   // Labels never get focus!
+    if( _tcsstr(pThis->GetClass(), DUI_CTR_LABEL) != NULL ) return NULL;   // Labels never get focus!
     return pFS->bPickNext ? pThis : NULL;
 }
 
@@ -2992,7 +3460,7 @@ CControlUI* CALLBACK CPaintManagerUI::__FindControlFromClass(CControlUI* pThis, 
 {
     LPCTSTR pstrType = static_cast<LPCTSTR>(pData);
     LPCTSTR pType = pThis->GetClass();
-    CStdPtrArray* pFoundControls = pThis->GetManager()->GetFoundControls();
+    CDuiPtrArray* pFoundControls = pThis->GetManager()->GetFoundControls();
     if( _tcscmp(pstrType, _T("*")) == 0 || _tcscmp(pstrType, pType) == 0 ) {
         int iIndex = -1;
         while( pFoundControls->GetAt(++iIndex) != NULL ) ;
